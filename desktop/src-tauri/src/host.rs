@@ -1,0 +1,262 @@
+//! Spawn the bundled Node host and wait for port 3080 to be reachable.
+//!
+//! This is the only place the Rust shell touches the Node runtime. The host
+//! then serves the entire upstream dsh web profile (apiproxy + business
+//! plugins + the bundled apps/web/dist frontend).
+
+use std::time::Duration;
+
+use tauri::{AppHandle, Manager};
+use tokio::net::TcpStream;
+
+use crate::error::{AppError, AppResult};
+use crate::state::AppState;
+
+/// Default host port the upstream `dsh web` profile listens on.
+pub const HOST_PORT: u16 = 3080;
+const HOST_BIND: &str = "127.0.0.1";
+/// Maximum time we'll wait for the host to come up before giving up.
+const READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Polling interval for the port check.
+const READY_POLL: Duration = Duration::from_millis(200);
+/// tsx loader spec — `node --import tsx/esm <file.ts>` runs TypeScript source
+/// at the loader layer (ESM hook) without a build step. sidecar-build copies
+/// the upstream's source tree + workspace node_modules under
+/// `dsh-runtime/`, so `tsx` is resolvable through `dsh-runtime/node_modules`.
+const TSX_LOADER: &str = "tsx/esm";
+
+/// Resolved spawn parameters for the Node child. Two modes:
+///
+///   - **Production**: `bin_ts` + `node_bin` come from `tauri.conf.json`'s
+///     `bundle.resources` via Tauri's resource_dir; `cwd` is the upstream
+///     CLI dir if it landed in the bundle, or just resource_dir otherwise.
+///
+///   - **Dev** (`cargo run` / `tauri dev`): resource_dir points at
+///     `desktop/src-tauri/target/<profile>/` which has no upstream copy —
+///     we fall back to the user's actual workspace, located two directories
+///     above `CARGO_MANIFEST_DIR`. NODE_PATH points at the workspace
+///     `node_modules` so ESM resolution finds pnpm-installed deps without
+///     any copying.
+struct SpawnContext {
+    node_bin: std::path::PathBuf,
+    bin_ts: std::path::PathBuf,
+    cwd: std::path::PathBuf,
+    node_path: std::path::PathBuf,
+}
+
+fn resolve_spawn_context(app: &AppHandle) -> AppResult<SpawnContext> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| AppError::Other(format!("resource_dir: {e}")))?;
+
+    // Try the bundled-resource path first.
+    let bundled_node = if cfg!(windows) {
+        resource_dir.join("node").join("node.exe")
+    } else {
+        resource_dir.join("node").join("bin").join("node")
+    };
+    let bundled_bin = resource_dir.join("dsh-runtime").join("bin.ts");
+    if bundled_node.exists() && bundled_bin.exists() {
+        // Production: bundle has the runtime. cwd into the bundled dsh-runtime
+        // so the import-graph resolves from there.
+        let cwd = resource_dir.join("dsh-runtime");
+        let node_path = cwd.join("node_modules");
+        return Ok(SpawnContext {
+            node_bin: bundled_node,
+            bin_ts: bundled_bin,
+            cwd,
+            node_path,
+        });
+    }
+
+    // Dev fallback: use the user's workspace. CARGO_MANIFEST_DIR is set by
+    // cargo at compile time to <repo>/desktop/src-tauri; two levels up is the
+    // repo root, where `apps/cli/src/bin.ts` and `node_modules` live.
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| AppError::Other("could not resolve repo root from CARGO_MANIFEST_DIR".into()))?
+        .to_path_buf();
+
+    let dev_node = which_node();
+    let dev_bin = repo_root.join("apps").join("cli").join("src").join("bin.ts");
+    if !dev_bin.exists() {
+        return Err(AppError::Other(format!(
+            "dev bin.ts not found at {}; set DSH_UPSTREAM_ROOT or run from the repo root",
+            dev_bin.display()
+        )));
+    }
+    let dev_cwd = repo_root.join("apps").join("cli");
+    let dev_node_path = repo_root.join("node_modules");
+    log::info!(
+        "dev mode: spawning upstream CLI from {} with NODE_PATH={}",
+        dev_cwd.display(),
+        dev_node_path.display()
+    );
+    Ok(SpawnContext {
+        node_bin: dev_node,
+        bin_ts: dev_bin,
+        cwd: dev_cwd,
+        node_path: dev_node_path,
+    })
+}
+
+/// Find a `node` binary on PATH. In dev we use the user's installed Node
+/// (Tauri's devUrl flow needs the same Node anyway); in production we ship
+/// our own under `desktop/node/`. Returns the first match.
+fn which_node() -> std::path::PathBuf {
+    let cmd = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(out) = std::process::Command::new(cmd).arg("node").output() {
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if let Some(line) = s.lines().next() {
+                let p = std::path::PathBuf::from(line.trim());
+                if p.exists() {
+                    return p;
+                }
+            }
+        }
+    }
+    std::path::PathBuf::from(if cfg!(windows) { "node.exe" } else { "node" })
+}
+
+/// 1. Resolve Node + dsh-runtime/bin.ts (bundled, or dev-fallback to upstream).
+/// 2. Spawn `node --import tsx/esm <bin.ts> web` (the upstream web profile).
+/// 3. Wait for `127.0.0.1:HOST_PORT` to accept TCP connections.
+/// 4. Show the main window.
+pub async fn spawn_and_wait(app: &AppHandle) -> AppResult<()> {
+    log::info!("spawn_and_wait: entered");
+    let ctx = resolve_spawn_context(app)?;
+    log::info!(
+        "spawn_and_wait: node={:?} bin_ts={:?} cwd={:?}",
+        ctx.node_bin, ctx.bin_ts, ctx.cwd
+    );
+
+    let mut cmd = tokio::process::Command::new(&ctx.node_bin);
+    // `node --import tsx/esm <file.ts>` — tsx hooks the ESM loader so the
+    // upstream TypeScript source runs as-is, no `tsc -b + tsdown` step.
+    cmd.arg(format!("--import={TSX_LOADER}"))
+        .arg(&ctx.bin_ts)
+        .arg("web")
+        .arg("--port")
+        .arg(HOST_PORT.to_string())
+        .current_dir(&ctx.cwd)
+        .env("DSH_HOME", resolve_dsh_home(app))
+        .env("DSH_LAUNCH_ENVIRONMENT", "desktop")
+        .env("NODE_PATH", ctx.node_path.clone())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| {
+        AppError::Other(format!(
+            "spawn `{ctx_node:?} {bin_ts:?}` failed: {e}",
+            ctx_node = ctx.node_bin,
+            bin_ts = ctx.bin_ts,
+        ))
+    })?;
+
+    // Forward stdout/stderr to tracing so the user can see host output in the log.
+    if let Some(stdout) = child.stdout.take() {
+        let app_for_log = app.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                log::info!(target: "dsh.host", "{line}");
+                let _ = app_for_log.try_state::<AppState>();
+            }
+        });
+    }
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, BufReader};
+            let mut reader = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = reader.next_line().await {
+                log::warn!(target: "dsh.host", "{line}");
+            }
+        });
+    }
+
+    wait_for_port(HOST_BIND, HOST_PORT, READY_TIMEOUT).await?;
+
+    if let Some(state) = app.try_state::<AppState>() {
+        state.install_host_child(child);
+    } else {
+        let _ = child.start_kill();
+        return Err(AppError::Other("AppState missing".into()));
+    }
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+
+    log::info!("node host ready on {HOST_BIND}:{HOST_PORT}");
+    Ok(())
+}
+
+/// Resolve the bundled node binary and the dsh-runtime/bin.ts entrypoint
+/// inside the Tauri resource directory. (Kept for the production path —
+/// `resolve_spawn_context` is the dev-aware version that calls this when
+/// the bundle is present.)
+#[allow(dead_code)]
+fn resolve_paths(app: &AppHandle) -> AppResult<(std::path::PathBuf, std::path::PathBuf)> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| AppError::Other(format!("resource_dir: {e}")))?;
+
+    let node_bin = if cfg!(windows) {
+        resource_dir.join("node").join("node.exe")
+    } else {
+        resource_dir.join("node").join("bin").join("node")
+    };
+    if !node_bin.exists() {
+        return Err(AppError::Other(format!(
+            "bundled node binary not found at {}",
+            node_bin.display()
+        )));
+    }
+
+    let bin_ts = resource_dir.join("dsh-runtime").join("bin.ts");
+    if !bin_ts.exists() {
+        return Err(AppError::Other(format!(
+            "dsh-runtime/bin.ts not found at {}",
+            bin_ts.display()
+        )));
+    }
+
+    Ok((node_bin, bin_ts))
+}
+
+fn resolve_dsh_home(app: &AppHandle) -> String {
+    if let Ok(v) = std::env::var("DSH_HOME") {
+        return v;
+    }
+    if let Some(state) = app.try_state::<AppState>() {
+        return state.dsh_home.display().to_string();
+    }
+    "~/.dsh".to_string()
+}
+
+/// Poll the TCP port until it accepts a connection or the timeout elapses.
+async fn wait_for_port(host: &str, port: u16, timeout: Duration) -> AppResult<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let addr = format!("{host}:{port}");
+    loop {
+        match TcpStream::connect(&addr).await {
+            Ok(_) => return Ok(()),
+            Err(_) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(AppError::HostNotReady(format!(
+                        "port {addr} not reachable after {timeout:?}"
+                    )));
+                }
+                tokio::time::sleep(READY_POLL).await;
+            }
+        }
+    }
+}

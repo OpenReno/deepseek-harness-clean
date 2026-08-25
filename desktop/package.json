@@ -1,0 +1,19 @@
+{
+  "name": "@deepseek-ai/dsh-desktop",
+  "version": "0.1.1-rc.2",
+  "description": "Tauri 2 shell for DeepSeek Harness: thin OS layer that bundles Node + Python + dsh-runtime so users don't need to install them.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/sidecar-build.mjs && tauri build",
+    "build:debug": "node scripts/sidecar-build.mjs && tauri build --debug",
+    "tauri": "tauri",
+    "check": "cargo check --manifest-path src-tauri/Cargo.toml",
+    "clippy": "cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0"
+  }
+}
