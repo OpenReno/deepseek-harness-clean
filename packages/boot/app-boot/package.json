@@ -32,10 +32,10 @@
   ],
   "license": "MIT",
   "dependencies": {
-    "js-yaml": "^4.2.0"
+    "js-yaml": "^4.2.0",
+    "@deepseek-ai/cordis-plugin-group": "workspace:^"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis-plugin-group": "workspace:^",
     "@deepseek-ai/cordis-plugin-hmr": "workspace:^",
     "@deepseek-ai/cordis-plugin-include": "workspace:^",
     "@deepseek-ai/cordis-plugin-loader": "workspace:^",
