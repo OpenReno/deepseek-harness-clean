@@ -100,6 +100,26 @@ The Rust side rarely needs changes unless the **OS command surface** shifts. Ups
 
 **Current status**: the dev fallback path (host.rs spawns upstream source via `tsx` + `NODE_PATH`) is fully working end-to-end. The production path works through bin.js + the limited peer-dep promotion but is not yet robust against every possible missing peer. A future commit will pick one of the three real fixes above.
 
+### Production `pnpm deploy` strips peer dependencies
+
+`pnpm deploy --prod --legacy` does **not** include peerDependencies, but apps/cli's runtime reaches many workspace packages only via peer declarations (Cordis plugin architecture: peers are provided by the host, deploy has no host). Result: the upstream CLI fails at module load with `ERR_MODULE_NOT_FOUND` for each missing package.
+
+**Workarounds already applied** (in `c9c7ac8e9e` and `9cbd4fe792`):
+
+- `packages/boot/app-boot/package.json`: moved `@deepseek-ai/cordis-plugin-group` from `peerDependencies` to `dependencies`
+- `packages/context/session-reference/package.json`: moved `@deepseek-ai/dsh-compaction` from `peerDependencies` to `dependencies`
+- `apps/cli/package.json`: directly lists `@deepseek-ai/dsh-compaction`, `@deepseek-ai/cordis-plugin-group`, `@deepseek-ai/dsh-output-retention`, `@deepseek-ai/dsh-timeout`, `@deepseek-ai/dsh-scope`, `@deepseek-ai/dsh-sandbox` so pnpm deploy includes them at the top of the resolved graph
+
+**Whack-a-mole does not converge.** A scan of `desktop/.deploy/cli/lib/**` + the `.pnpm` tree finds **~96 unique `@deepseek-ai/*` imports**. apps/cli previously declared ~30 directly; the rest are reached through transitive runtime references in plugins (Cordis loader walks the entry tree at startup). Every promoted peer surfaces the next missing one — this branch has fixed 6, the production deploy still fails on 70+ more.
+
+**Production deploy is therefore INCOMPLETE on this branch.** The supported path is **dev fallback** (host.rs spawns the upstream source via `tsx` with `NODE_PATH=upstream/node_modules`).
+
+**Real fixes** (not yet applied — pick one when production matters):
+
+1. **Bulk-promote all 70+ transitively-imported workspace packages to `apps/cli/package.json` dependencies** (whack-a-mole complete — works, but creates merge noise in selective upstream sync)
+2. **Custom deploy script** that scans the `.pnpm` tree and creates the missing top-level symlinks at install time (`mklink /J` works on Windows without admin, but `cp` + `verbatimSymlinks` requires admin/dev-mode)
+3. **Switch from pnpm deploy to a flat `nodeLinker=hoisted` install** (drops strict-mode isolation, but eliminates the peer-dep gap entirely)
+
 ### `pnpm install` over the upstream workspace
 
 ```bash
