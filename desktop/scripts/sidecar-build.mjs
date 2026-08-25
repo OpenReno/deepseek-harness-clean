@@ -15,17 +15,27 @@
 //   node scripts/sidecar-build.mjs --dev    # dsh-runtime + web dist only
 //
 // Phases:
-//   0. Stage upstream CLI source + workspace node_modules under
-//      desktop/dsh-runtime/. (See buildUpstreamLibs for why we don't compile.)
-//   1. Build apps/web/dist (vite build).
-//   2. (skipped in --dev) Download a portable Node.js runtime into desktop/node/.
-//   3. (skipped in --dev) Download a portable Python runtime into desktop/python/.
+//   0. (production only) Build upstream CLI for bundling — `pnpm install
+//      --ignore-scripts` to link deps without lefthook postinstall, then
+//      `pnpm exec tsc -b tsconfig.host.json` + `pnpm exec tsdown --env
+//      .DSH_BUILD_FACE host` to compile + emit Typert codegen, then
+//      `pnpm deploy --prod --legacy` to drop the self-contained CLI into a
+//      staging dir. dev mode skips this and relies on host.rs's dev-fallback
+//      (which spawns the upstream source directly with tsx + NODE_PATH).
+//   1. Stage the deploy dir under desktop/dsh-runtime/ via cp -rL (cyclic-
+//      symlink safe).
+//   2. Build apps/web/dist (vite build).
+//   3. (skipped in --dev) Download a portable Node.js runtime into desktop/node/.
+//   4. (skipped in --dev) Download a portable Python runtime into desktop/python/.
 //
 // The Tauri shell expects:
-//   desktop/dsh-runtime/bin.js              ← built CLI entry
-//   desktop/dsh-runtime/lib                 ← built CLI types
+//   desktop/dsh-runtime/bin.ts              ← built CLI entry (hoisted from
+//                                            apps/cli/src/bin.ts)
+//   desktop/dsh-runtime/src                ← other CLI sources (transitively
+//                                            imported by bin.ts)
 //   desktop/dsh-runtime/node_modules        ← bundled workspace deps
 //   desktop/dsh-runtime/config              ← CLI config defaults
+//   desktop/dsh-runtime/package.json        ← CLI manifest
 //   desktop/apps/web/dist                   ← frontend assets served by CLI
 //   desktop/node/node.exe                   ← Node runtime (Windows)
 //   desktop/node/node                       ← Node runtime (POSIX, in bin/)
@@ -54,15 +64,34 @@ function step(msg) {
 
 /** Run a command, inheriting stdio. Returns a promise that resolves on exit-0.
  *
- * Pass `viaShell: true` (or any option that includes shell:true) for Windows
- * `.cmd` / `.bat` files — Node 18+ blocks them under `shell:false` for the
- * CVE-2024-27980 batch-injection class. Only use `viaShell:true` with
- * hardcoded argument strings; never with values that came from argv, env, or
- * a config file, since shell:false is the only thing that prevents the host
- * shell from interpreting metacharacters in those values.
+ * On Windows, `.cmd` / `.bat` shims (e.g. `pnpm.cmd`) can't be invoked
+ * directly: Node 18+ blocks them with EINVAL for security (CVE-2024-27980),
+ * and a `shell:true` workaround breaks when the binary path contains
+ * spaces (e.g. `C:\Program Files\Git\...`). The reliable fix is to wrap
+ * the spawn in `cmd.exe /d /s /c <cmd> <args...>`, which is what `shell:true`
+ * does internally — but explicit, with `windowsVerbatimArguments:true` so
+ * Node hands the command line to cmd.exe unmodified. The `windowsHide:true`
+ * flag suppresses the flash of a console window on Windows GUI apps.
  */
 function run(cmd, args, opts = {}) {
   const { viaShell = false, ...rest } = opts
+  const isWin = process.platform === 'win32'
+  const lower = cmd.toLowerCase()
+  const needsCmdWrapper = isWin && (lower.endsWith('.cmd') || lower.endsWith('.bat'))
+  if (needsCmdWrapper) {
+    return new Promise((resolve, reject) => {
+      const child = spawn('cmd.exe', ['/d', '/s', '/c', cmd, ...args], {
+        stdio: 'inherit',
+        windowsHide: true,
+        ...rest,
+      })
+      child.on('error', reject)
+      child.on('exit', (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(`cmd.exe /c ${cmd} ${args.join(' ')} exited with ${code}`))
+      })
+    })
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { stdio: 'inherit', shell: viaShell, ...rest })
     child.on('error', reject)
@@ -165,6 +194,92 @@ async function downloadTo(url, dest, label) {
 }
 
 /**
+ * Phase 0a — install upstream workspace deps without postinstall scripts.
+ *
+ * Upstream's `install-lefthook.mjs` (root postinstall) imports the
+ * `lefthook` package as a JSON-import side-effect — the import runs before
+ * its `if (CI === 'true') return` guard, so even CI-mode pnpm exits 1 with
+ * `ERR_MODULE_NOT_FOUND` when `lefthook` is dev-skipped. `--ignore-scripts`
+ * sidesteps that entirely; we then rely on the user's `pnpm install`
+ * having already run on this workspace, or run it ourselves here if the
+ * workspace hasn't been initialized.
+ */
+async function ensureWorkspaceInstalled(pnpm) {
+  const nodeModules = path.join(repoRoot, 'node_modules')
+  if (existsSync(nodeModules)) {
+    console.log('   workspace already installed; skipping pnpm install')
+    return
+  }
+  console.log('   workspace missing node_modules; running pnpm install --ignore-scripts')
+  await run(pnpm, ['install', '--frozen-lockfile', '--ignore-scripts'], {
+    cwd: repoRoot,
+    env: { ...process.env, CI: 'true' },
+  })
+}
+
+/**
+ * Phase 0b — compile the upstream TypeScript that the deploy step bundles.
+ * Replaces the previous (broken) `pnpm run --filter ... build:lib:host`
+ * invocation, which triggered an internal install check that ran the
+ * root postinstall (lefthook) and failed. `pnpm exec` does NOT trigger
+ * that check, so we run the same two commands upstream's package.json
+ * declares — `tsc -b` + `tsdown --env.DSH_BUILD_FACE host` — without the
+ * install-lifecycle side trip.
+ *
+ * The order matters: `tsdown` is what emits Typert's `lib/typert
+ * .remote-client.{js,d.ts}` (via the typertPlugin registered in the
+ * root tsdown.config.ts). Until that runs, downstream packages' `./remote`
+ * subpath imports fail with TS2307 and cascade into 39 TS errors. See
+ * `.agents/notes/implemented/architecture/2026-08-02-typert-remote-method-calls.md`.
+ */
+async function buildUpstreamTs(pnpm) {
+  step('0. Compiling upstream TypeScript (tsc -b + tsdown host)…')
+  await ensureWorkspaceInstalled(pnpm)
+
+  await run(pnpm, ['exec', 'tsc', '-b', 'tsconfig.host.json'], {
+    cwd: repoRoot,
+    env: { ...process.env, CI: 'true' },
+  })
+  await run(pnpm, ['exec', 'tsdown', '--env.DSH_BUILD_FACE', 'host'], {
+    cwd: repoRoot,
+    env: { ...process.env, CI: 'true' },
+  })
+}
+
+/**
+ * Phase 0c — `pnpm deploy` to drop the CLI + workspace deps into a flat,
+ * self-contained staging dir. Uses `--legacy` (pnpm 10+ otherwise requires
+ * the deployed package to declare `inject-workspace-packages=true`, which
+ * upstream's apps/cli doesn't) and `--prod` to strip devDependencies.
+ * CI=true keeps pnpm's interactive "remove modules dir?" prompt from
+ * aborting under non-TTY spawn.
+ */
+async function deployUpstreamCli(pnpm) {
+  step('0. Deploying apps/cli into a self-contained bundle (pnpm deploy)…')
+  const deployDir = path.join(desktopDir, '.deploy', 'cli')
+  await rm(deployDir, { recursive: true, force: true })
+
+  // pnpm 11 syntax: `pnpm --filter=<pkg> deploy <target-dir> [--prod]`.
+  // The target dir is a positional arg, NOT `--target`.
+  await run(pnpm, [
+    '--filter', '@deepseek-ai/dsh',
+    'deploy', deployDir,
+    '--prod',
+    '--legacy',
+  ], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      CI: 'true',
+      LEFTHOOK: '0',
+      pnpm_config_confirm_modules_purge: 'false',
+      npm_config_confirm_modules_purge: 'false',
+    },
+  })
+  return deployDir
+}
+
+/**
  * Resolve a platform+arch tuple to Node.js archive names. Node ships its
  * release archives named `node-v{ver}-{platform}-{arch}.{ext}`:
  *   win-x64.zip, win-arm64.zip
@@ -259,46 +374,53 @@ async function extractZip(archivePath, intoDir) {
 }
 
 /**
- * Phase 0 — stage the upstream CLI source under `desktop/dsh-runtime/`.
+ * Phase 0 + 1 — build upstream CLI for production, deploy to staging,
+ * then stage under desktop/dsh-runtime/.
  *
- * Dev mode runs the upstream CLI directly from the user's workspace
- * (resolved via CARGO_MANIFEST_DIR → repo root), with NODE_PATH pointing at
- * the workspace `node_modules`. The staging here is only for the production
- * bundle path; we copy source, NOT node_modules, because pnpm's content-
- * addressable symlinks create cyclic workspace deps that any recursive copy
- * trips over (cordis ↔ cordis-plugin-include, etc.). The bundled production
- * shape will need a separate materialization step (e.g. `pnpm deploy --prod
- * --legacy --ignore-scripts` from apps/cli into a flat node_modules).
- *
- * Until that materialization step lands, the bundled resource path is
- * unfinished; running this build in `--dev` mode is a no-op (host.rs falls
- * back to the dev spawn context), and `tauri build` would ship an empty
- * dsh-runtime/ that fails to start. Phase 2 (Node download) is the only
- * piece of the production path that's been wired up; Phase 3 (Python) is a
- * stub; the materialization step belongs between Phase 0 and Phase 1.
+ * Production: buildUpstreamTs() → deployUpstreamCli() → copy staging to
+ *            dsh-runtime/. dsh-runtime ends up with bin.js + lib/ + a flat
+ *            node_modules from pnpm deploy.
+ * Dev:        the upstream TS source is copied directly (bin.ts hoisted to
+ *            dsh-runtime/bin.ts, src/ alongside). The Tauri shell falls
+ *            back to its dev spawn context (host.rs) which runs the source
+ *            via `node --import tsx/esm` — no compiled artifacts needed.
  */
-async function buildUpstreamLibs(_pnpm) {
-  step('0. Staging upstream CLI source under dsh-runtime/ (production bundle prep)…')
-  const cliDir = path.join(repoRoot, 'apps', 'cli')
+async function buildUpstreamLibs(pnpm) {
   const target = path.join(desktopDir, 'dsh-runtime')
   await rm(target, { recursive: true, force: true })
   await mkdir(target, { recursive: true })
 
-  // Mirror Tauri's resource map. The CLI's entry is `apps/cli/src/bin.ts`;
-  // hoist it to `dsh-runtime/bin.ts` so host.rs can spawn by a stable path.
-  await cp(path.join(cliDir, 'src', 'bin.ts'), path.join(target, 'bin.ts'))
-  await cp(path.join(cliDir, 'src'), path.join(target, 'src'), { recursive: true })
-  await cp(path.join(cliDir, 'config'), path.join(target, 'config'), { recursive: true })
-  await cp(path.join(cliDir, 'package.json'), path.join(target, 'package.json'))
-
-  // Tauri requires these directories to exist even when empty so the bundle
-  // resource mapping doesn't choke on missing entries.
-  await mkdir(path.join(target, 'lib'), { recursive: true })
-  await mkdir(path.join(target, 'node_modules'), { recursive: true })
-
-  if (!existsSync(path.join(target, 'bin.ts'))) {
-    throw new Error(`bin.ts missing after staging — does ${cliDir}/src/bin.ts exist?`)
+  if (isDev) {
+    // Dev: copy upstream source + node_modules so a stand-alone `tauri dev`
+    // can still find them on the bundled path. host.rs prefers the dev
+    // context when present, but the staging ensures bundle keys resolve.
+    step('0. Staging upstream CLI source under dsh-runtime/ (dev)…')
+    const cliDir = path.join(repoRoot, 'apps', 'cli')
+    await cp(path.join(cliDir, 'src', 'bin.ts'), path.join(target, 'bin.ts'))
+    await cp(path.join(cliDir, 'src'), path.join(target, 'src'), { recursive: true })
+    await cp(path.join(cliDir, 'config'), path.join(target, 'config'), { recursive: true })
+    await cp(path.join(cliDir, 'package.json'), path.join(target, 'package.json'))
+    await mkdir(path.join(target, 'lib'), { recursive: true })
+    await mkdir(path.join(target, 'node_modules'), { recursive: true })
+    console.log(`   staged at ${path.relative(repoRoot, target)}`)
+    return
   }
+
+  await buildUpstreamTs(pnpm)
+  const deployDir = await deployUpstreamCli(pnpm)
+
+  step('1. Staging CLI deploy under desktop/dsh-runtime/ (cp -rL)…')
+  // cp -rL handles cyclic workspace deps (cordis ↔ cordis-plugin-include)
+  // by following each symlink once and refusing to recurse into a directory
+  // already copied. fs.cp({dereference:true}) would ELOOP here.
+  const cpBin = (() => {
+    try {
+      const found = spawnSync('where', ['cp'], { encoding: 'utf8' })
+      const first = found.stdout.split(/\r?\n/).map((l) => l.trim()).find(Boolean)
+      return first || 'cp'
+    } catch { return 'cp' }
+  })()
+  await run(cpBin, ['-rL', deployDir, target])
   console.log(`   staged at ${path.relative(repoRoot, target)}`)
 }
 
@@ -308,7 +430,7 @@ async function buildWeb(pnpm) {
     '--silent',
     '--filter', '@deepseek-ai/dsh-web-frontend',
     'build',
-  ], { cwd: repoRoot, viaShell: true })
+  ], { cwd: repoRoot })
   const dist = path.join(repoRoot, 'apps', 'web', 'dist')
   if (!existsSync(path.join(dist, 'index.html'))) {
     throw new Error('vite build did not produce dist/index.html')
@@ -492,7 +614,7 @@ async function flattenSingleSubdir(dir) {
 
 async function main() {
   const pnpm = resolvePnpm()
-  await buildUpstreamLibs()
+  await buildUpstreamLibs(pnpm)
   await buildWeb(pnpm)
   await stageNode()
   await stagePython()
