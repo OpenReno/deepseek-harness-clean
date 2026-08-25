@@ -433,9 +433,12 @@ async function stageUpstreamLibs(pnpm) {
  */
 async function finalizeDshRuntime(_pnpm) {
   const deployDir = path.join(desktopDir, '.deploy', 'cli')
-  if (!existsSync(path.join(deployDir, 'bin.js'))) {
+  // pnpm deploy stages apps/cli with its `files` manifest:
+  //   "files": ["lib/*.js", "config"]
+  // so the entry lives at deployDir/lib/bin.js, not deployDir/bin.js.
+  if (!existsSync(path.join(deployDir, 'lib', 'bin.js'))) {
     throw new Error(
-      `${deployDir}/bin.js missing — run \`node scripts/sidecar-build.mjs --stage\` first`,
+      `${deployDir}/lib/bin.js missing — run \`node scripts/sidecar-build.mjs --stage\` first`,
     )
   }
   const target = path.join(desktopDir, 'dsh-runtime')

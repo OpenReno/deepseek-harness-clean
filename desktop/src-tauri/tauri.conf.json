@@ -43,8 +43,8 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../dsh-runtime/bin.ts": "dsh-runtime/bin.ts",
-      "../dsh-runtime/src": "dsh-runtime/src",
+      "../dsh-runtime/lib/bin.js": "dsh-runtime/lib/bin.js",
+      "../dsh-runtime/lib": "dsh-runtime/lib",
       "../dsh-runtime/config": "dsh-runtime/config",
       "../dsh-runtime/node_modules": "dsh-runtime/node_modules",
       "../dsh-runtime/package.json": "dsh-runtime/package.json",

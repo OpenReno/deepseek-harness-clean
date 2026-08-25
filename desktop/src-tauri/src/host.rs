@@ -39,9 +39,15 @@ const TSX_LOADER: &str = "tsx/esm";
 ///     any copying.
 struct SpawnContext {
     node_bin: std::path::PathBuf,
-    bin_ts: std::path::PathBuf,
+    /// The CLI entrypoint path. Production: a compiled `bin.js` from the
+    /// pnpm-deploy bundle (run with plain node). Dev: the upstream TS source
+    /// `bin.ts`, run via `node --import tsx/esm` so we don't have to build.
+    entry: std::path::PathBuf,
     cwd: std::path::PathBuf,
     node_path: std::path::PathBuf,
+    /// When true, prepend `--import tsx/esm` so the runtime loader handles
+    /// `entry`'s TypeScript syntax. False when entry is already JS.
+    use_tsx: bool,
 }
 
 fn resolve_spawn_context(app: &AppHandle) -> AppResult<SpawnContext> {
@@ -56,17 +62,33 @@ fn resolve_spawn_context(app: &AppHandle) -> AppResult<SpawnContext> {
     } else {
         resource_dir.join("node").join("bin").join("node")
     };
-    let bundled_bin = resource_dir.join("dsh-runtime").join("bin.ts");
-    if bundled_node.exists() && bundled_bin.exists() {
-        // Production: bundle has the runtime. cwd into the bundled dsh-runtime
-        // so the import-graph resolves from there.
+    // Production: compiled entry is at dsh-runtime/lib/bin.js (the
+    // package.json "bin" mapping). dev stub or staged CI builds may still
+    // expose bin.ts; prefer the compiled form when both exist.
+    let bundled_bin_js = resource_dir.join("dsh-runtime").join("lib").join("bin.js");
+    let bundled_bin_ts = resource_dir.join("dsh-runtime").join("bin.ts");
+    if bundled_node.exists() && (bundled_bin_js.exists() || bundled_bin_ts.exists()) {
+        // dsh-runtime/ in production is a Windows directory junction onto
+        // the .deploy/cli staging dir (see sidecar-build.mjs --finalize), so
+        // reading lib/bin.js from here resolves through to the deployed
+        // bundle's compiled entry.
         let cwd = resource_dir.join("dsh-runtime");
         let node_path = cwd.join("node_modules");
+        if bundled_bin_js.exists() {
+            return Ok(SpawnContext {
+                node_bin: bundled_node,
+                entry: bundled_bin_js,
+                cwd,
+                node_path,
+                use_tsx: false,
+            });
+        }
         return Ok(SpawnContext {
             node_bin: bundled_node,
-            bin_ts: bundled_bin,
+            entry: bundled_bin_ts,
             cwd,
             node_path,
+            use_tsx: true,
         });
     }
 
@@ -97,9 +119,10 @@ fn resolve_spawn_context(app: &AppHandle) -> AppResult<SpawnContext> {
     );
     Ok(SpawnContext {
         node_bin: dev_node,
-        bin_ts: dev_bin,
+        entry: dev_bin,
         cwd: dev_cwd,
         node_path: dev_node_path,
+        use_tsx: true,
     })
 }
 
@@ -122,6 +145,20 @@ fn which_node() -> std::path::PathBuf {
     std::path::PathBuf::from(if cfg!(windows) { "node.exe" } else { "node" })
 }
 
+/// Strip the Windows extended-length path prefix (`\\?\`) when handing a
+/// path to Node's CLI. Tauri's `resource_dir()` returns paths with this
+/// prefix, but Node's argv parsing truncates at the colon after the prefix
+/// and tries to resolve just the drive letter, surfacing as EISDIR instead
+/// of finding the entry. No-op on POSIX.
+fn strip_unc_prefix(p: &std::path::Path) -> std::path::PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        p.to_path_buf()
+    }
+}
+
 /// 1. Resolve Node + dsh-runtime/bin.ts (bundled, or dev-fallback to upstream).
 /// 2. Spawn `node --import tsx/esm <bin.ts> web` (the upstream web profile).
 /// 3. Wait for `127.0.0.1:HOST_PORT` to accept TCP connections.
@@ -130,31 +167,37 @@ pub async fn spawn_and_wait(app: &AppHandle) -> AppResult<()> {
     log::info!("spawn_and_wait: entered");
     let ctx = resolve_spawn_context(app)?;
     log::info!(
-        "spawn_and_wait: node={:?} bin_ts={:?} cwd={:?}",
-        ctx.node_bin, ctx.bin_ts, ctx.cwd
+        "spawn_and_wait: node={:?} entry={:?} cwd={:?} tsx={}",
+        ctx.node_bin, ctx.entry, ctx.cwd, ctx.use_tsx
     );
 
     let mut cmd = tokio::process::Command::new(&ctx.node_bin);
-    // `node --import tsx/esm <file.ts>` — tsx hooks the ESM loader so the
-    // upstream TypeScript source runs as-is, no `tsc -b + tsdown` step.
-    cmd.arg(format!("--import={TSX_LOADER}"))
-        .arg(&ctx.bin_ts)
+    if ctx.use_tsx {
+        // Dev path: tsx hooks the ESM loader so the upstream TypeScript
+        // source runs as-is, no `tsc -b + tsdown` step.
+        cmd.arg(format!("--import={TSX_LOADER}"));
+    }
+    // Strip the Windows extended-length path prefix (\\?\) when passing
+    // paths to Node — its CLI parser truncates at the colon after the prefix
+    // and tries to resolve just `C:`, producing EISDIR instead of finding
+    // our entry.
+    cmd.arg(strip_unc_prefix(&ctx.entry))
         .arg("web")
         .arg("--port")
         .arg(HOST_PORT.to_string())
-        .current_dir(&ctx.cwd)
+        .current_dir(strip_unc_prefix(&ctx.cwd))
         .env("DSH_HOME", resolve_dsh_home(app))
         .env("DSH_LAUNCH_ENVIRONMENT", "desktop")
-        .env("NODE_PATH", ctx.node_path.clone())
+        .env("NODE_PATH", strip_unc_prefix(&ctx.node_path))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
 
     let mut child = cmd.spawn().map_err(|e| {
         AppError::Other(format!(
-            "spawn `{ctx_node:?} {bin_ts:?}` failed: {e}",
+            "spawn `{ctx_node:?} {entry:?}` failed: {e}",
             ctx_node = ctx.node_bin,
-            bin_ts = ctx.bin_ts,
+            entry = ctx.entry,
         ))
     })?;
 
