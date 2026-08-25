@@ -272,6 +272,13 @@ async function buildUpstreamTs(pnpm) {
  * upstream's apps/cli doesn't) and `--prod` to strip devDependencies.
  * CI=true keeps pnpm's interactive "remove modules dir?" prompt from
  * aborting under non-TTY spawn.
+ *
+ * Note: pnpm deploy --prod strips peerDependencies. The upstream code
+ * reaches many runtime imports through peer declarations, so we
+ * incrementally promote those into `dependencies` in `apps/cli/package.json`
+ * (see `c9c7ac8e9e` and the README's "Known limitations" section). When
+ * a new ERR_MODULE_NOT_FOUND surfaces at runtime, add the missing peer
+ * to apps/cli and re-deploy.
  */
 async function deployUpstreamCli(pnpm) {
   step('0. Deploying apps/cli into a self-contained bundle (pnpm deploy)…')
