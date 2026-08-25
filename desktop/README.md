@@ -78,6 +78,38 @@ pnpm --dir desktop run build
 
 The Rust side rarely needs changes unless the **OS command surface** shifts. Upstream changes to `packages/host/apiproxy`, business plugins, etc. flow through automatically — no Rust merge work needed.
 
+## Known limitations (workarounds applied)
+
+### Production `pnpm deploy` strips peer dependencies
+
+`pnpm deploy --prod --legacy` does **not** include peerDependencies, but apps/cli's runtime reaches several workspace packages only via peer declarations on transitive deps (Cordis plugin architecture: peers are provided by the host, deploy has no host). Result: the upstream CLI fails at module load with `ERR_MODULE_NOT_FOUND` for each missing package.
+
+**Workarounds already applied** (in `c9c7ac8e9e`):
+
+- `packages/boot/app-boot/package.json`: moved `@deepseek-ai/cordis-plugin-group` from `peerDependencies` to `dependencies`
+- `packages/context/session-reference/package.json`: moved `@deepseek-ai/dsh-compaction` from `peerDependencies` to `dependencies`
+- `apps/cli/package.json`: directly lists `@deepseek-ai/dsh-compaction`, `@deepseek-ai/cordis-plugin-group`, `@deepseek-ai/dsh-output-retention` so pnpm deploy includes them at the top of the resolved graph
+
+**Insufficient alone**: pnpm deploy's depth-of-resolve doesn't follow peer→dep promotion for every transitive peer. The runtime still surfaces `ERR_MODULE_NOT_FOUND` for other peer-only packages (e.g. `@deepseek-ai/dsh-invariants`, `@deepseek-ai/dsh-llm`).
+
+**Real fixes** (not yet applied):
+
+1. Promote every needed peer to `dependencies` in `apps/cli/package.json` (whack-a-mole, see commit message)
+2. Use `pnpm install --config.node-linker=hoisted` to flatten `node_modules/` and deploy that directly (drops strict-mode isolation, but no peer-dep gap)
+3. Skip `pnpm deploy` entirely; have `sidecar-build.mjs` `cp` the upstream `node_modules/` into `desktop/dsh-runtime/node_modules/` and rely on Tauri's resource copy for `bin.js` + `lib/` only (loses strict isolation but is dead-simple and complete)
+
+**Current status**: the dev fallback path (host.rs spawns upstream source via `tsx` + `NODE_PATH`) is fully working end-to-end. The production path works through bin.js + the limited peer-dep promotion but is not yet robust against every possible missing peer. A future commit will pick one of the three real fixes above.
+
+### `pnpm install` over the upstream workspace
+
+```bash
+cd "C:\Users\smallMark\Desktop\deepseek-harness-clean"
+pnpm install                          # one-time, links all workspace deps
+CI=true pnpm install --no-frozen-lockfile --ignore-scripts   # after editing any package.json (avoid lefthook postinstall)
+```
+
+`--ignore-scripts` skips the root `install-lefthook.mjs` postinstall (which crashes because `lefthook` is filtered out as a root devDep under `--filter` context). `CI=true` does the same on the other side of the CI/non-CI guard inside that script.
+
 ## Bundle size budget
 
 | Component | Size (target) | Source |
