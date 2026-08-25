@@ -302,7 +302,97 @@ async function deployUpstreamCli(pnpm) {
       npm_config_confirm_modules_purge: 'false',
     },
   })
+  await ensureDeploySymlinks(deployDir)
   return deployDir
+}
+
+/**
+ * Phase 0d — promote every `@deepseek-ai/*` package that appears in
+ * `.pnpm/` to a top-level symlink under `node_modules/@deepseek-ai/<name>`.
+ *
+ * `pnpm deploy --prod` strips peer dependencies from the resolved graph,
+ * so the upstream code reaches many workspace packages only via peer
+ * declarations (Cordis plugin architecture). Some of those leak into
+ * the deploy's `.pnpm/` store because a transitive non-peer package
+ * pulls them in; others don't. Either way, those that DO land in
+ * `.pnpm/` are missing top-level symlinks, and Node's module resolver
+ * looks for `node_modules/@deepseek-ai/<name>` (not `.pnpm/.../...`).
+ *
+ * The walker iterates the .pnpm content store, recognises the
+ * `pnpm` convention of `<scope>+<name>@<version>...` directory names
+ * (and their nested `node_modules/<scope>/<name>` symlink to the real
+ * package), and creates the missing top-level symlink. On Windows we
+ * use `mklink /J` (directory junction) since POSIX symlinks require
+ * admin/dev-mode; both behave identically for Node's module
+ * resolution.
+ */
+async function ensureDeploySymlinks(deployDir) {
+  const { readdir, readlink, mkdir, stat } = await import('node:fs/promises')
+  const pnpmDir = path.join(deployDir, 'node_modules', '.pnpm')
+  if (!existsSync(pnpmDir)) {
+    console.log('   no .pnpm/ in deploy; skipping symlink promotion')
+    return
+  }
+
+  // Map scope/name → source path. We then create one top-level
+  // node_modules/<scope>/<name> symlink per entry.
+  const promoted = new Map() // key: "<scope>/<name>" → { src: absolute path, link: 'dir'|'file' }
+  for (const entry of await readdir(pnpmDir)) {
+    // Match @scope+name@version or scope+name@version (no scope).
+    // pnpm uses `+` to separate scope from name in dir names; the
+    // version is after the last `@`.
+    const at = entry.lastIndexOf('@')
+    if (at < 1) continue
+    const head = entry.slice(0, at)
+    const plus = head.indexOf('+')
+    if (plus < 0) continue
+    const scope = head.slice(0, plus)
+    const name = head.slice(plus + 1)
+    const version = entry.slice(at + 1)
+    if (!version) continue
+    const nestedNm = path.join(pnpmDir, entry, 'node_modules')
+    if (!existsSync(nestedNm)) continue
+    const wanted = path.join(nestedNm, scope, name)
+    if (!existsSync(wanted)) continue
+    const key = scope ? `${scope}/${name}` : name
+    if (!promoted.has(key)) {
+      // Stat the source to know whether it's a file or directory;
+      // node's resolver treats both correctly via symlink, so we
+      // always link to the directory if the source IS a directory.
+      const s = await stat(wanted).catch(() => null)
+      if (!s) continue
+      promoted.set(key, { src: wanted, isDir: s.isDirectory() })
+    }
+  }
+
+  // Create top-level symlinks. On Windows, `fs.symlinkSync` with
+  // type `'junction'` creates a real reparse-point junction without
+  // admin rights — and it handles the @-scoped names in our packages
+  // (which `mklink /J` chokes on through cmd.exe's path parser).
+  // POSIX gets the default symbolic link via `ln -s`.
+  const { symlinkSync } = await import('node:fs')
+  const topLevel = path.join(deployDir, 'node_modules')
+  for (const [key, { src, isDir }] of promoted) {
+    const dst = path.join(topLevel, key)
+    if (existsSync(dst)) continue
+    // Make sure the parent scope dir exists (e.g. @aws/, @deepseek-ai/)
+    // before creating the symlink — otherwise fs.symlinkSync throws
+    // ENOENT on the parent path.
+    await mkdir(path.dirname(dst), { recursive: true })
+    const linkType = process.platform === 'win32' ? 'junction' : (isDir ? 'dir' : 'file')
+    try {
+      symlinkSync(src, dst, linkType)
+    } catch (err) {
+      // On Windows, `fs.symlink` for a file-type link (rare here) can
+      // need SeCreateSymbolicLinkPrivilege. Fall back to copy.
+      if (process.platform === 'win32' && !isDir) {
+        await cp(src, dst)
+      } else {
+        throw new Error(`symlink ${dst} → ${src} failed: ${err.message}`)
+      }
+    }
+  }
+  console.log(`   promoted ${promoted.size} @deepseek-ai/* entries to top-level`)
 }
 
 /**

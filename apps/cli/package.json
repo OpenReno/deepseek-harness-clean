@@ -84,6 +84,7 @@
     "@deepseek-ai/dsh-timeout": "workspace:^",
     "@deepseek-ai/dsh-scope": "workspace:^",
     "@deepseek-ai/dsh-sandbox": "workspace:^",
+    "@deepseek-ai/dsh-shell": "workspace:^",
     "commander": "^15.0.0",
     "@deepseek-ai/cordis": "workspace:^",
     "js-yaml": "^4.2.0",

@@ -237,6 +237,9 @@ importers:
       '@deepseek-ai/dsh-session-reference':
         specifier: workspace:^
         version: link:../../packages/context/session-reference
+      '@deepseek-ai/dsh-shell':
+        specifier: workspace:^
+        version: link:../../packages/shell/shell
       '@deepseek-ai/dsh-skill':
         specifier: workspace:^
         version: link:../../packages/skill/skill
