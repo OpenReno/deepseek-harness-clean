@@ -338,24 +338,31 @@ async function ensureDeploySymlinks(deployDir) {
   // node_modules/<scope>/<name> symlink per entry.
   const promoted = new Map() // key: "<scope>/<name>" → { src: absolute path, link: 'dir'|'file' }
   for (const entry of await readdir(pnpmDir)) {
-    // Match @scope+name@version or scope+name@version (no scope).
-    // pnpm uses `+` to separate scope from name in dir names; the
-    // version is after the last `@`.
-    const at = entry.lastIndexOf('@')
-    if (at < 1) continue
-    const head = entry.slice(0, at)
-    const plus = head.indexOf('+')
+    // pnpm encodes each package as `<scope>+<name>[@version|_hash]`, with
+    // `+` separating scope from name. When the version collides with another
+    // package already in the store, pnpm appends a `_sha1` discriminator
+    // instead of the version, AND truncates the directory name to keep the
+    // overall path under filesystem limits — so the real package name on
+    // disk can be longer than what fits in the .pnpm/ directory name. The
+    // previous parser tried to recover the name from the dir name itself,
+    // which lost the trailing characters (`dsh-api-remotes` showed up as
+    // `dsh-api-remote` and never matched the actual `node_modules/<scope>/`
+    // subdir). Don't try to recover — read the real name straight from the
+    // nested `node_modules/<scope>/` directory on disk.
+    const plus = entry.indexOf('+')
     if (plus < 0) continue
-    const scope = head.slice(0, plus)
-    const name = head.slice(plus + 1)
-    const version = entry.slice(at + 1)
-    if (!version) continue
+    const scope = entry.slice(0, plus)
     const nestedNm = path.join(pnpmDir, entry, 'node_modules')
-    if (!existsSync(nestedNm)) continue
-    const wanted = path.join(nestedNm, scope, name)
-    if (!existsSync(wanted)) continue
-    const key = scope ? `${scope}/${name}` : name
-    if (!promoted.has(key)) {
+    let scopeDirNames
+    try {
+      scopeDirNames = await readdir(path.join(nestedNm, scope))
+    } catch {
+      continue
+    }
+    for (const name of scopeDirNames) {
+      const wanted = path.join(nestedNm, scope, name)
+      const key = `${scope}/${name}`
+      if (promoted.has(key)) continue
       // Stat the source to know whether it's a file or directory;
       // node's resolver treats both correctly via symlink, so we
       // always link to the directory if the source IS a directory.

@@ -458,7 +458,23 @@ function clientConfig(id: string, entry: string): UserConfig {
       // table cannot answer is a guaranteed runtime throw, so the rule is the
       // package's own request list: requested specifiers stay imports,
       // everything else is bundled.
-      alwaysBundle: (specifier: string) => !isRequested(specifier),
+      //
+      // Function-form `alwaysBundle` is unreliable for workspace SUBPATH
+      // imports — rolldown's per-spec resolution treats `name/sub` paths as
+      // implicit externals before the function runs, so a sibling package's
+      // `@scope/name/remote` (the typert-generated remote-client) keeps its
+      // CJS `require()` call verbatim into the bundle, then explodes at
+      // browser materialization with `client-modules: require(...) missed the
+      // module table`. A regex list does not share that blind spot; the
+      // negative-lookahead bundles every remaining non-platform specifier
+      // (npm deps like zod/clsx and every @deepseek-ai dep outside the
+      // requested module table).
+      alwaysBundle: [
+        INLINE_SAFE,
+        VENDORED_LIBRARY,
+        GENERATED_REMOTE,
+        /^(?!(?:react|react-dom)(?:\/|$)|@deepseek-ai\/)/,
+      ],
     },
     // Browser bundles inline node-idiom deps (zustand/immer read
     // process.env.NODE_ENV; zustand's esm build also probes
