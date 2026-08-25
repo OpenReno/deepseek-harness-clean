@@ -12,7 +12,16 @@
 //
 // Usage:
 //   node scripts/sidecar-build.mjs          # full bundle (production)
-//   node scripts/sidecar-build.mjs --dev    # dsh-runtime + web dist only
+//   node scripts/sidecar-build.mjs --dev    # dsh-runtime (source copy) + web dist
+//   node scripts/sidecar-build.mjs --stage  # only build upstream + pnpm deploy
+//                                          # → leaves desktop/.deploy/ on disk
+//                                          # (saves ~4 GB transient: peak disk
+//                                          # usage is at this step)
+//   node scripts/sidecar-build.mjs --finalize
+//                                          # skip build; assume .deploy/ exists,
+//                                          # copy → dsh-runtime + Node + Python
+//                                          # + vite. Combine with --stage to
+//                                          # split the run across disk cycles.
 //
 // Phases:
 //   0. (production only) Build upstream CLI for bundling — `pnpm install
@@ -27,6 +36,12 @@
 //   2. Build apps/web/dist (vite build).
 //   3. (skipped in --dev) Download a portable Node.js runtime into desktop/node/.
 //   4. (skipped in --dev) Download a portable Python runtime into desktop/python/.
+//
+// Disk note: the `pnpm deploy` staging dir is ~4 GB (it materializes the
+// entire workspace dep tree as real files). On a tight disk, run
+// `--stage` to land it in `desktop/.deploy/`, free space, then run
+// `--finalize` to copy + run Phases 2/3/4. The two flags are independent
+// so the user controls when peak disk usage happens.
 //
 // The Tauri shell expects:
 //   desktop/dsh-runtime/bin.ts              ← built CLI entry (hoisted from
@@ -56,6 +71,10 @@ const desktopDir = path.resolve(__dirname, '..')
 const repoRoot = path.resolve(desktopDir, '..')
 
 const isDev = process.argv.includes('--dev')
+const isStage = process.argv.includes('--stage')
+const isFinalize = process.argv.includes('--finalize')
+// Default: run both stages. --stage: only upstream build + pnpm deploy.
+// --finalize: only copy + vite + Node + Python. Combine to split disk peaks.
 
 /** Pretty-print a step header. */
 function step(msg) {
@@ -374,26 +393,20 @@ async function extractZip(archivePath, intoDir) {
 }
 
 /**
- * Phase 0 + 1 — build upstream CLI for production, deploy to staging,
- * then stage under desktop/dsh-runtime/.
- *
- * Production: buildUpstreamTs() → deployUpstreamCli() → copy staging to
- *            dsh-runtime/. dsh-runtime ends up with bin.js + lib/ + a flat
- *            node_modules from pnpm deploy.
- * Dev:        the upstream TS source is copied directly (bin.ts hoisted to
- *            dsh-runtime/bin.ts, src/ alongside). The Tauri shell falls
- *            back to its dev spawn context (host.rs) which runs the source
- *            via `node --import tsx/esm` — no compiled artifacts needed.
+ * Stage — `pnpm deploy` + (optional) build, leaves desktop/.deploy/ on disk.
+ * Split from finalizeDshRuntime so the user can free disk space between
+ * the ~4 GB staging write and the ~4 GB cp -rL copy. On a tight disk:
+ *   node scripts/sidecar-build.mjs --stage        # builds .deploy/, exit
+ *   # clean up other stuff, then:
+ *   node scripts/sidecar-build.mjs --finalize     # cp .deploy → dsh-runtime
  */
-async function buildUpstreamLibs(pnpm) {
-  const target = path.join(desktopDir, 'dsh-runtime')
-  await rm(target, { recursive: true, force: true })
-  await mkdir(target, { recursive: true })
-
+async function stageUpstreamLibs(pnpm) {
   if (isDev) {
-    // Dev: copy upstream source + node_modules so a stand-alone `tauri dev`
-    // can still find them on the bundled path. host.rs prefers the dev
-    // context when present, but the staging ensures bundle keys resolve.
+    // Dev: copy upstream source straight into dsh-runtime/ (host.rs's dev
+    // context uses it). No .deploy/ intermediate needed.
+    const target = path.join(desktopDir, 'dsh-runtime')
+    await rm(target, { recursive: true, force: true })
+    await mkdir(target, { recursive: true })
     step('0. Staging upstream CLI source under dsh-runtime/ (dev)…')
     const cliDir = path.join(repoRoot, 'apps', 'cli')
     await cp(path.join(cliDir, 'src', 'bin.ts'), path.join(target, 'bin.ts'))
@@ -407,7 +420,27 @@ async function buildUpstreamLibs(pnpm) {
   }
 
   await buildUpstreamTs(pnpm)
-  const deployDir = await deployUpstreamCli(pnpm)
+  await deployUpstreamCli(pnpm)
+  // NB: we deliberately do NOT cp -rL here — that belongs to --finalize.
+  console.log(`   staged at ${path.relative(repoRoot, path.join(desktopDir, '.deploy', 'cli'))}`)
+}
+
+/**
+ * Finalize — copy .deploy/cli → dsh-runtime/. Pairs with stageUpstreamLibs.
+ * On a one-shot run (no --stage / --finalize flags), buildUpstreamLibs runs
+ * the whole pipeline and skips this step (it stages straight to
+ * dsh-runtime/).
+ */
+async function finalizeDshRuntime(_pnpm) {
+  const deployDir = path.join(desktopDir, '.deploy', 'cli')
+  if (!existsSync(path.join(deployDir, 'bin.js'))) {
+    throw new Error(
+      `${deployDir}/bin.js missing — run \`node scripts/sidecar-build.mjs --stage\` first`,
+    )
+  }
+  const target = path.join(desktopDir, 'dsh-runtime')
+  await rm(target, { recursive: true, force: true })
+  await mkdir(target, { recursive: true })
 
   step('1. Staging CLI deploy under desktop/dsh-runtime/ (cp -rL)…')
   // cp -rL handles cyclic workspace deps (cordis ↔ cordis-plugin-include)
@@ -422,6 +455,17 @@ async function buildUpstreamLibs(pnpm) {
   })()
   await run(cpBin, ['-rL', deployDir, target])
   console.log(`   staged at ${path.relative(repoRoot, target)}`)
+}
+
+/**
+ * One-shot wrapper: runs stage (--dev path stages directly to dsh-runtime)
+ * then materialize. Skipped when --stage / --finalize gates are explicit.
+ */
+async function buildUpstreamLibs(pnpm) {
+  await stageUpstreamLibs(pnpm)
+  if (!isDev) {
+    await finalizeDshRuntime(pnpm)
+  }
 }
 
 async function buildWeb(pnpm) {
@@ -614,7 +658,25 @@ async function flattenSingleSubdir(dir) {
 
 async function main() {
   const pnpm = resolvePnpm()
-  await buildUpstreamLibs(pnpm)
+  // --stage: build upstream + pnpm deploy → desktop/.deploy/. Stop here so
+  // the user can free disk space before the next stage.
+  if (isStage) {
+    await stageUpstreamLibs(pnpm)
+    if (isDev) {
+      console.log('\n\x1b[32m✓\x1b[0m stage complete — dsh-runtime/ (source copy) ready')
+    } else {
+      console.log('\n\x1b[32m✓\x1b[0m stage complete — desktop/.deploy/cli/ ready')
+      console.log('   next: free disk space, then run --finalize (or full build)')
+    }
+    return
+  }
+  // --finalize: assume desktop/.deploy/ exists (from --stage or previous
+  // full build), copy to dsh-runtime/ + run vite + Node + Python.
+  if (isFinalize) {
+    await finalizeDshRuntime(pnpm)
+  } else {
+    await buildUpstreamLibs(pnpm)
+  }
   await buildWeb(pnpm)
   await stageNode()
   await stagePython()
