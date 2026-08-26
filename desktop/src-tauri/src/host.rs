@@ -233,6 +233,19 @@ pub async fn spawn_and_wait(app: &AppHandle) -> AppResult<()> {
     }
 
     if let Some(window) = app.get_webview_window("main") {
+        // Production MSI ships the embedded apps/web/dist as a placeholder
+        // redirect HTML — but Tauri 2's WebView2 backend doesn't honor
+        // `<meta http-equiv="refresh">` across protocols (tauri://localhost
+        // → http://127.0.0.1:3080 is a cross-protocol navigation the
+        // webview drops). The shell itself does the navigation now:
+        // once the Node host is listening, point the webview at the
+        // upstream URL and let the host's index-injection run normally.
+        // In dev mode the webview is already at this URL via devUrl; the
+        // navigate() is a no-op there.
+        let url = format!("http://{HOST_BIND}:{HOST_PORT}/");
+        if let Err(err) = window.navigate(url.parse().expect("hardcoded URL is valid")) {
+            log::warn!("webview navigate to {url} failed: {err}");
+        }
         let _ = window.show();
         let _ = window.set_focus();
     }
