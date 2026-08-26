@@ -287,17 +287,26 @@ async function deployUpstreamCli(pnpm) {
 
   // pnpm 11 syntax: `pnpm --filter=<pkg> deploy <target-dir> [--prod]`.
   // The target dir is a positional arg, NOT `--target`.
+  // Three layers of "skip the install hooks" defense — the root package.json's
+  // `node scripts/install-lefthook.mjs` postinstall runs during pnpm deploy's
+  // internal `pnpm install --production` and crashes with ERR_MODULE_NOT_FOUND
+  // when lefthook isn't a production dep (it isn't; CI=true would normally
+  // short-circuit the script but install-lefthook.mjs has a static
+  // `import 'lefthook/package.json'` at the top of the file that fails before
+  // the function body executes, so the early return never runs).
   await run(pnpm, [
     '--filter', '@deepseek-ai/dsh',
     'deploy', deployDir,
     '--prod',
     '--legacy',
+    '--ignore-scripts',
   ], {
     cwd: repoRoot,
     env: {
       ...process.env,
       CI: 'true',
       LEFTHOOK: '0',
+      pnpm_config_ignore_scripts: 'true',
       pnpm_config_confirm_modules_purge: 'false',
       npm_config_confirm_modules_purge: 'false',
     },
