@@ -27,7 +27,7 @@
     "beforeDevCommand": "node ../scripts/sidecar-build.mjs --dev",
     "beforeBuildCommand": "node scripts/sidecar-build.mjs",
     "devUrl": "http://127.0.0.1:3080",
-    "frontendDist": "../apps/web/dist"
+    "frontendDist": "../../apps/web/dist"
   },
   "bundle": {
     "active": true,

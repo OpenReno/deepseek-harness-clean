@@ -10,3 +10,8 @@ src-tauri/signer.key
 dsh-runtime/
 node/
 python/
+# Local mirror of apps/web/dist that some older docs pointed at as the
+# production frontend root. The actual Vite output lives one level up at
+# ../../apps/web/dist (workspace root); see tauri.conf.json -> build.frontendDist.
+# Keep this entry so a future local mirror can't be committed by mistake.
+apps/web/
