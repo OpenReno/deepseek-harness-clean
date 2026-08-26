@@ -45,3 +45,5 @@ desktop/src-tauri/gen/
 worktrees/
 .agents/worktrees/
 .typert-*/
+dsh-runtime.tar.gz
+packages/client/modules/dist/
