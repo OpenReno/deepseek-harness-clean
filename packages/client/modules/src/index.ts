@@ -240,9 +240,18 @@ const PARSER_PRELOAD_IDS = [CLIENT_MODULES_ID, CLIENT_RUNTIME_ID] as const
  */
 export function bootInjections(graph: WebBootGraph): IndexInjection[] {
   const bootstrapId = JSON.stringify(CLIENT_MODULES_ID)
+  // The queue facade is read by the app entry via `globalThis.__ModuleLoader__`
+  // (see @deepseek-ai/dsh-client-web/src/boot.ts). In standard browsers
+  // `window === globalThis`, but WebView2's first-launch initialization has
+  // surfaced a race where the inline script's `window` assignment doesn't
+  // propagate to the `globalThis` the module entry sees. Mirror the
+  // assignment to both names so whichever alias the entry reads first wins,
+  // and add a defensive sync-queue import hook on the module side too (the
+  // AppWebEntry's missing-facade throw remains a loud failure when neither
+  // path is present — a real deployment hole, not a race).
   const queue = `(()=>{
 const pendingQueue=[]
-window.__ModuleLoader__={
+const facade={
   mode:"queue",
   pendingQueue,
   load(registration){pendingQueue.push(registration)},
@@ -261,6 +270,10 @@ window.__ModuleLoader__={
     return exports.createClientModuleSystem(this,{id:registration.id,exports},options)
   }
 }
+try{Object.defineProperty(globalThis,"__ModuleLoader__",{value:facade,configurable:true,writable:true})}catch{}
+try{Object.defineProperty(window,"__ModuleLoader__",{value:facade,configurable:true,writable:true})}catch{}
+try{globalThis.__ModuleLoader__=facade}catch{}
+try{window.__ModuleLoader__=facade}catch{}
 })()`
   const preload = PARSER_PRELOAD_IDS.map(id => graph.entries.find(entry => entry.id === id))
     .filter((entry): entry is WebBootEntry => entry !== undefined)
