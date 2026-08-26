@@ -1,14 +1,5 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "DeepSeek Harness",
-  "version": "0.1.1-rc.2",
-  "identifier": "ai.deepseek.harness.desktop",
-  "build": {
-    "beforeDevCommand": "node ../scripts/sidecar-build.mjs --dev",
-    "beforeBuildCommand": "node ../scripts/sidecar-build.mjs",
-    "devUrl": "http://127.0.0.1:3080",
-    "frontendDist": "../apps/web/dist"
-  },
   "app": {
     "windows": [
       {
@@ -31,6 +22,12 @@
       "iconAsTemplate": true,
       "menuOnLeftClick": false
     }
+  },
+  "build": {
+    "beforeDevCommand": "node ../scripts/sidecar-build.mjs --dev",
+    "beforeBuildCommand": "node ../scripts/sidecar-build.mjs",
+    "devUrl": "http://127.0.0.1:3080",
+    "frontendDist": "../apps/web/dist"
   },
   "bundle": {
     "active": true,
@@ -55,13 +52,20 @@
     "shortDescription": "DeepSeek Harness — AI agent harness, zero-install desktop",
     "longDescription": "Bundles Node.js + Python + the upstream dsh runtime. No external dependencies required."
   },
+  "identifier": "ai.deepseek.harness.desktop",
   "plugins": {
     "deep-link": {
-      "schemes": ["dsh"]
+      "schemes": [
+        "dsh"
+      ]
     },
     "updater": {
-      "endpoints": ["https://releases.deepseek-harness.dev/latest.json"],
-      "pubkey": "REPLACE_WITH_PUBLIC_KEY"
+      "endpoints": [
+        "https://releases.deepseek-harness.dev/latest.json"
+      ],
+      "pubkey": "KECPcYT89HHxO7yCiYdc/deDbkFLA6iwdOguYzuQxeg="
     }
-  }
+  },
+  "productName": "DeepSeek Harness",
+  "version": "0.1.1-rc.2"
 }
