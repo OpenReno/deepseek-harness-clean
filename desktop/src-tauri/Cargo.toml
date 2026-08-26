@@ -46,6 +46,11 @@ once_cell = "1"
 futures-util = "0.3"
 parking_lot = "0.12"
 log = "0.4"
+# Extract dsh-runtime.tar.gz (single-file MSI resource, sidesteps WiX
+# failing on the 100k+ files in node_modules). Pure-Rust so we don't
+# shell out to a system tar binary.
+tar = "0.4"
+flate2 = "1"
 
 [features]
 default = ["custom-protocol"]

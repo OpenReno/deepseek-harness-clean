@@ -43,6 +43,7 @@
       "../.deploy/cli/lib": "dsh-runtime/lib",
       "../.deploy/cli/config": "dsh-runtime/config",
       "../.deploy/cli/package.json": "dsh-runtime/package.json",
+      "../dsh-runtime.tar.gz": "dsh-runtime.tar.gz",
       "../node": "node",
       "../python": "python"
     },

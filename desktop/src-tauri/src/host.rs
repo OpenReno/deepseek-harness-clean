@@ -4,8 +4,11 @@
 //! then serves the entire upstream dsh web profile (apiproxy + business
 //! plugins + the bundled apps/web/dist frontend).
 
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use flate2::read::GzDecoder;
 use tauri::{AppHandle, Manager};
 use tokio::net::TcpStream;
 
@@ -159,12 +162,66 @@ fn strip_unc_prefix(p: &std::path::Path) -> std::path::PathBuf {
     }
 }
 
+/// Extract the bundled `dsh-runtime.tar.gz` over `<resource_dir>/dsh-runtime/`
+/// on first launch. The MSI ships a single tarball resource (the deploy
+/// tree is ~100k files, which is more than the WiX bundler can enumerate
+/// on this sandbox). After extraction the directory layout matches what
+/// `pnpm deploy` produced locally: `lib/`, `node_modules/`, `config/`,
+/// `package.json`. Subsequent launches skip the extract — the marker file
+/// `.dsh-runtime-extracted` records the tarball mtime so an updated MSI
+/// release re-extracts on next launch.
+fn ensure_dsh_runtime_extracted(app: &AppHandle) -> AppResult<()> {
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| AppError::Other(format!("resource_dir: {e}")))?;
+    let dest = resource_dir.join("dsh-runtime");
+    let marker = dest.join(".dsh-runtime-extracted");
+    let tarball = resource_dir.join("dsh-runtime.tar.gz");
+
+    if !tarball.exists() {
+        // Dev fallback (no bundled tarball) or fresh install with a different
+        // resource layout. resolve_spawn_context will fall back to the
+        // workspace if the dest tree is empty.
+        return Ok(());
+    }
+    if marker.exists() {
+        if let (Ok(marker_meta), Ok(tar_meta)) = (marker.metadata(), tarball.metadata()) {
+            if let (Ok(mt), Ok(tt)) = (marker_meta.modified(), tar_meta.modified()) {
+                if mt >= tt {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    log::info!("extracting {} → {}", tarball.display(), dest.display());
+    let f = std::fs::File::open(&tarball)
+        .map_err(|e| AppError::Other(format!("open tarball: {e}")))?;
+    let gz = GzDecoder::new(f);
+    let mut archive = tar::Archive::new(gz);
+    archive
+        .unpack(&dest)
+        .map_err(|e| AppError::Other(format!("extract tarball: {e}")))?;
+    // Touch the marker to the tarball's mtime so the next launch skips
+    // when the resource hasn't been replaced.
+    if let Ok(tar_meta) = tarball.metadata() {
+        let _ = std::fs::File::create(&marker).and_then(|f| {
+            f.set_modified(tar_meta.modified().unwrap_or(std::time::SystemTime::now()))
+        });
+    } else {
+        let _ = std::fs::File::create(&marker);
+    }
+    Ok(())
+}
+
 /// 1. Resolve Node + dsh-runtime/bin.ts (bundled, or dev-fallback to upstream).
 /// 2. Spawn `node --import tsx/esm <bin.ts> web` (the upstream web profile).
 /// 3. Wait for `127.0.0.1:HOST_PORT` to accept TCP connections.
 /// 4. Show the main window.
 pub async fn spawn_and_wait(app: &AppHandle) -> AppResult<()> {
     log::info!("spawn_and_wait: entered");
+    ensure_dsh_runtime_extracted(app)?;
     let ctx = resolve_spawn_context(app)?;
     log::info!(
         "spawn_and_wait: node={:?} entry={:?} cwd={:?} tsx={}",
