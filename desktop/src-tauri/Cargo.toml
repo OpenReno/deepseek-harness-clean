@@ -1,6 +1,6 @@
 [package]
 name = "dsh-desktop"
-version = "0.1.1-rc.2"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.85"
 description = "Tauri shell for DeepSeek Harness — thin OS layer only"

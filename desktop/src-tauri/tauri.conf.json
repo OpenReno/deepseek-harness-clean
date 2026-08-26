@@ -40,11 +40,9 @@
       "icons/icon.ico"
     ],
     "resources": {
-      "../dsh-runtime/lib/bin.js": "dsh-runtime/lib/bin.js",
-      "../dsh-runtime/lib": "dsh-runtime/lib",
-      "../dsh-runtime/config": "dsh-runtime/config",
-      "../dsh-runtime/node_modules": "dsh-runtime/node_modules",
-      "../dsh-runtime/package.json": "dsh-runtime/package.json",
+      "../.deploy/cli/lib": "dsh-runtime/lib",
+      "../.deploy/cli/config": "dsh-runtime/config",
+      "../.deploy/cli/package.json": "dsh-runtime/package.json",
       "../node": "node",
       "../python": "python"
     },
@@ -67,5 +65,5 @@
     }
   },
   "productName": "DeepSeek Harness",
-  "version": "0.1.1-rc.2"
+  "version": "0.5.0"
 }
